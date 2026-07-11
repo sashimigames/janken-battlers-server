@@ -168,7 +168,8 @@ function startRaidRoom(idA, idB, nameA, nameB, difficulty) {
     difficulty,
     players: [idA, idB],
     names: { [idA]: nameA, [idB]: nameB },
-    playerCards: {},
+    playerDecks: {},   // socketId -> [{id,hp,maxHp,atk,winBonus,hand}, x3]
+    activeIdx: {},     // socketId -> current active card index (0-2)
     boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ultPercent: bossSpec.ultPercent },
     turnCount: 0,
     hands: {},
@@ -192,6 +193,18 @@ function startRaidRoom(idA, idB, nameA, nameB, difficulty) {
   });
 }
 
+// 現在の活きてるカードのindexを返す(activeIdxが倒れてたら次の生存カードへ自動で進める)
+// 全滅してたら null
+function ensureAliveActive(room, socketId) {
+  const deck = room.playerDecks[socketId];
+  let idx = room.activeIdx[socketId];
+  if (deck[idx] && deck[idx].hp > 0) return idx;
+  const aliveIdx = deck.findIndex((c) => c.hp > 0);
+  if (aliveIdx === -1) return null; // 全滅
+  room.activeIdx[socketId] = aliveIdx;
+  return aliveIdx;
+}
+
 function resolveRaidTurn(room) {
   const [idA, idB] = room.players;
   const bossHand = ['rock', 'scissors', 'paper'][Math.floor(Math.random() * 3)];
@@ -200,7 +213,8 @@ function resolveRaidTurn(room) {
 
   const results = {};
   [idA, idB].forEach((id) => {
-    const card = room.playerCards[id];
+    const idx = room.activeIdx[id];
+    const card = room.playerDecks[id][idx];
     const hand = room.hands[id];
     const outcome = judgeHand(hand, bossHand); // cardから見た結果
     let bossDamage = 0;
@@ -213,25 +227,38 @@ function resolveRaidTurn(room) {
       playerDamage = room.boss.atk + room.boss.winBonus;
       card.hp = Math.max(0, card.hp - playerDamage);
     }
-    results[id] = { hand, outcome, bossDamage, playerDamage, hpAfter: card.hp };
+    results[id] = { hand, outcome, bossDamage, playerDamage, cardIdx: idx, hpAfter: card.hp, cardKO: card.hp <= 0 };
   });
 
-  // 必殺技(5ターンに1回、両プレイヤーに現HPの割合ダメージ、回避不可)
+  // 必殺技(5ターンに1回、両プレイヤーの現在アクティブカードに現HPの割合ダメージ、回避不可)
   let ultResults = null;
   if (isUltTurn) {
     ultResults = {};
     [idA, idB].forEach((id) => {
-      const card = room.playerCards[id];
+      const idx = room.activeIdx[id];
+      const card = room.playerDecks[id][idx];
       const dmg = Math.round(card.hp * room.boss.ultPercent);
       card.hp = Math.max(0, card.hp - dmg);
-      ultResults[id] = { damage: dmg, hpAfter: card.hp };
+      ultResults[id] = { damage: dmg, cardIdx: idx, hpAfter: card.hp, cardKO: card.hp <= 0 };
     });
   }
 
   room.hands = {};
 
+  // 倒れたカードがあれば次の生存カードへ自動交代。両者とも全滅していたらそのプレイヤーは戦闘不能。
+  const playersDown = [];
+  const swaps = {};
+  [idA, idB].forEach((id) => {
+    const before = room.activeIdx[id];
+    const aliveIdx = ensureAliveActive(room, id);
+    if (aliveIdx === null) {
+      playersDown.push(id);
+    } else if (aliveIdx !== before) {
+      swaps[id] = aliveIdx;
+    }
+  });
+
   const bossDefeated = room.boss.hp <= 0;
-  const playersDown = room.players.filter((id) => room.playerCards[id].hp <= 0);
 
   room.players.forEach((id) => {
     const oppId = otherRaidPlayer(room, id);
@@ -243,6 +270,8 @@ function resolveRaidTurn(room) {
       you: results[id],
       opponent: results[oppId],
       ultimate: isUltTurn ? { you: ultResults[id], opponent: ultResults[oppId] } : null,
+      yourAutoSwap: swaps[id] != null ? swaps[id] : null,
+      opponentAutoSwap: swaps[oppId] != null ? swaps[oppId] : null,
       bossDefeated,
       playersDown,
     });
@@ -441,31 +470,50 @@ io.on('connection', (socket) => {
     removeFromRaidQueue(socket.id);
   });
 
-  // data.card = { id, hp, atk, winBonus, hand } — アクティブカードのステータス
+  // data.deck = [{ id, hp, atk, winBonus, hand }, x3] — 3枚のステータス
   // (クライアント計算済みの値を信頼する。既存submit_deckと同じ信頼レベル)
-  socket.on('submit_raid_card', (data) => {
+  socket.on('submit_raid_deck', (data) => {
     try {
       const code = socket.data.raidRoomId;
       const room = raidRooms[code];
       if (!room) return;
-      const card = data && data.card;
-      if (!card || typeof card.hp !== 'number' || typeof card.atk !== 'number') return;
-      room.playerCards[socket.id] = { ...card, maxHp: card.hp };
+      const deck = data && data.deck;
+      if (!Array.isArray(deck) || deck.length !== 3) return;
+      if (!deck.every((c) => c && typeof c.hp === 'number' && typeof c.atk === 'number')) return;
+      room.playerDecks[socket.id] = deck.map((c) => ({ ...c, maxHp: c.hp }));
+      room.activeIdx[socket.id] = 0;
 
-      if (room.players.length === 2 && room.players.every((id) => room.playerCards[id])) {
+      if (room.players.length === 2 && room.players.every((id) => room.playerDecks[id])) {
         room.started = true;
         room.players.forEach((id) => {
           const oppId = otherRaidPlayer(room, id);
           io.to(id).emit('raid_battle_start', {
-            yourCard: room.playerCards[id],
-            opponentCard: room.playerCards[oppId],
+            yourDeck: room.playerDecks[id],
+            opponentDeck: room.playerDecks[oppId],
             opponentName: room.names[oppId],
             boss: room.boss,
           });
         });
       }
     } catch (e) {
-      console.error('[submit_raid_card]', e);
+      console.error('[submit_raid_deck]', e);
+    }
+  });
+
+  // 任意交代(ターン消費なし) — data.index = 交代先(0-2)、生存カードのみ可
+  socket.on('submit_raid_swap', (data) => {
+    try {
+      const code = socket.data.raidRoomId;
+      const room = raidRooms[code];
+      if (!room || !room.started || room.ended) return;
+      const idx = data && data.index;
+      const deck = room.playerDecks[socket.id];
+      if (!deck || !deck[idx] || deck[idx].hp <= 0) return;
+      room.activeIdx[socket.id] = idx;
+      const oppId = otherRaidPlayer(room, socket.id);
+      if (oppId) io.to(oppId).emit('raid_opponent_swap', { index: idx });
+    } catch (e) {
+      console.error('[submit_raid_swap]', e);
     }
   });
 
