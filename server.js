@@ -104,8 +104,8 @@ function leaveRoom(socket, { silent = false } = {}) {
 // ultPercent = 5ターンに1回の必殺技で、対象プレイヤーの「現在HP」に対して削る割合
 const RAID_BOSS_STATS = {
   easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ultPercent: 0.10 },
-  medium: { hp: 30000,  atk: 26, winBonus: 10, ultPercent: 0.30 },
-  hard:   { hp: 120000, atk: 80, winBonus: 32, ultPercent: 0.50 },
+  medium: { hp: 10000,  atk: 26, winBonus: 10, ultPercent: 0.30 },
+  hard:   { hp: 15000,  atk: 80, winBonus: 32, ultPercent: 0.50 },
 };
 const RAID_ULT_INTERVAL = 5; // 5ターンに1回
 
