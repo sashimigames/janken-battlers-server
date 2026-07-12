@@ -101,24 +101,58 @@ function leaveRoom(socket, { silent = false } = {}) {
 
 // ボスID→難易度ごとの基礎スペック(企画書の数値をそのまま反映)
 // dmgPerWin = atk + winBonus (通常の勝利ダメージ)
-// ultPercent = 5ターンに1回の必殺技で、対象プレイヤーの「現在HP」に対して削る割合
+// ult = 5ターンに1回の必殺技のダメージ計算方式(下のcomputeUltDamage参照)
 //
 // 新しいレイドボスを追加する時は、ここに1エントリ足すだけでOK
 // (クライアント側の RAID_BOSSES レジストリと bossId を一致させること)。
 const RAID_BOSS_REGISTRY = {
   erebos: {
-    easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ultPercent: 0.10 },
-    medium: { hp: 10000,  atk: 26, winBonus: 10, ultPercent: 0.30 },
-    hard:   { hp: 15000,  atk: 80, winBonus: 32, ultPercent: 0.50 },
+    easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ult: { type: 'percent', percent: 0.10 } },
+    medium: { hp: 10000,  atk: 26, winBonus: 10, ult: { type: 'percent', percent: 0.30 } },
+    hard:   { hp: 15000,  atk: 80, winBonus: 32, ult: { type: 'percent', percent: 0.50 } },
+  },
+  // 龍王-アストラガル(常設レイドボス)。HPはエレボスと同値の指定。
+  // atk/winBonus(通常勝利ダメージ)は指定がなかったのでエレボスと同値を暫定採用 — 調整可。
+  // 必殺技「龍の息吹」: 初級=固定20 / 中級=ランダム50〜200 / 上級=ランダム200〜即死
+  astragal: {
+    easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ult: { type: 'fixed', amount: 20 } },
+    medium: { hp: 10000,  atk: 26, winBonus: 10, ult: { type: 'random', min: 50, max: 200 } },
+    hard:   { hp: 15000,  atk: 80, winBonus: 32, ult: { type: 'lethalRandom', min: 200 } },
   },
 };
 const RAID_ULT_INTERVAL = 5; // 5ターンに1回
+
+// ボスの必殺技ダメージを ult スペックから計算する。
+// percent:      現在HPの一定割合を削る(エレボス方式)
+// fixed:        固定ダメージ(現在HPが上限)
+// random:       min〜maxの一様ランダム(現在HPが上限)
+// lethalRandom: min〜現在HPの一様ランダム(現在HPが上限そのものなので、理論上は即死もあり得る)
+function computeUltDamage(ult, currentHp) {
+  if (!ult || currentHp <= 0) return 0;
+  switch (ult.type) {
+    case 'percent':
+      return Math.min(currentHp, Math.round(currentHp * ult.percent));
+    case 'fixed':
+      return Math.min(currentHp, ult.amount);
+    case 'random': {
+      const dmg = ult.min + Math.floor(Math.random() * (ult.max - ult.min + 1));
+      return Math.min(currentHp, dmg);
+    }
+    case 'lethalRandom': {
+      const max = Math.max(ult.min, currentHp);
+      const dmg = ult.min + Math.floor(Math.random() * (max - ult.min + 1));
+      return Math.min(currentHp, dmg);
+    }
+    default:
+      return 0;
+  }
+}
 
 // raidRooms[code] = {
 //   code, difficulty, players: [socketId, socketId],
 //   names: {socketId: name},
 //   playerCards: {socketId: {id, hp, maxHp, atk, winBonus, hand}}, // hand = 得意手
-//   boss: {hp, maxHp, atk, winBonus, ultPercent},
+//   boss: {hp, maxHp, atk, winBonus, ult},
 //   turnCount: number,
 //   hands: {socketId: 'rock'|'scissors'|'paper'},
 //   started: bool, ended: bool,
@@ -183,7 +217,7 @@ function startRaidRoom(idA, idB, nameA, nameB, bossId, difficulty) {
     names: { [idA]: nameA, [idB]: nameB },
     playerDecks: {},   // socketId -> [{id,hp,maxHp,atk,winBonus,hand}, x3]
     activeIdx: {},     // socketId -> current active card index (0-2)
-    boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ultPercent: bossSpec.ultPercent },
+    boss: { hp: bossSpec.hp, maxHp: bossSpec.hp, atk: bossSpec.atk, winBonus: bossSpec.winBonus, ult: bossSpec.ult },
     turnCount: 0,
     hands: {},
     started: false,
@@ -251,7 +285,7 @@ function resolveRaidTurn(room) {
     [idA, idB].forEach((id) => {
       const idx = room.activeIdx[id];
       const card = room.playerDecks[id][idx];
-      const dmg = Math.round(card.hp * room.boss.ultPercent);
+      const dmg = computeUltDamage(room.boss.ult, card.hp);
       card.hp = Math.max(0, card.hp - dmg);
       ultResults[id] = { damage: dmg, cardIdx: idx, hpAfter: card.hp, cardKO: card.hp <= 0 };
     });
