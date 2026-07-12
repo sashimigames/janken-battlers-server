@@ -99,13 +99,18 @@ function leaveRoom(socket, { silent = false } = {}) {
 //  レイドバトル(2人協力・サーバー権威)
 // ============================================================
 
-// 難易度ごとのボス基礎スペック(企画書の数値をそのまま反映)
+// ボスID→難易度ごとの基礎スペック(企画書の数値をそのまま反映)
 // dmgPerWin = atk + winBonus (通常の勝利ダメージ)
 // ultPercent = 5ターンに1回の必殺技で、対象プレイヤーの「現在HP」に対して削る割合
-const RAID_BOSS_STATS = {
-  easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ultPercent: 0.10 },
-  medium: { hp: 10000,  atk: 26, winBonus: 10, ultPercent: 0.30 },
-  hard:   { hp: 15000,  atk: 80, winBonus: 32, ultPercent: 0.50 },
+//
+// 新しいレイドボスを追加する時は、ここに1エントリ足すだけでOK
+// (クライアント側の RAID_BOSSES レジストリと bossId を一致させること)。
+const RAID_BOSS_REGISTRY = {
+  erebos: {
+    easy:   { hp: 6000,   atk: 6,  winBonus: 2,  ultPercent: 0.10 },
+    medium: { hp: 10000,  atk: 26, winBonus: 10, ultPercent: 0.30 },
+    hard:   { hp: 15000,  atk: 80, winBonus: 32, ultPercent: 0.50 },
+  },
 };
 const RAID_ULT_INTERVAL = 5; // 5ターンに1回
 
@@ -119,12 +124,19 @@ const RAID_ULT_INTERVAL = 5; // 5ターンに1回
 //   started: bool, ended: bool,
 // }
 const raidRooms = {};
-// 難易度ごとの待機列: {easy: [...], medium: [...], hard: [...]}
-const raidQueues = { easy: [], medium: [], hard: [] };
+// ボスID×難易度ごとの待機列。キーは `${bossId}:${difficulty}` で動的に作る
+// (ボスが増えても配列を手動で足す必要がないように)。
+const raidQueues = {};
+
+function getRaidQueue(bossId, difficulty) {
+  const key = `${bossId}:${difficulty}`;
+  if (!raidQueues[key]) raidQueues[key] = [];
+  return raidQueues[key];
+}
 
 function removeFromRaidQueue(socketId) {
-  Object.keys(raidQueues).forEach((diff) => {
-    const q = raidQueues[diff];
+  Object.keys(raidQueues).forEach((key) => {
+    const q = raidQueues[key];
     const idx = q.findIndex((e) => e.socketId === socketId);
     if (idx !== -1) q.splice(idx, 1);
   });
@@ -160,11 +172,12 @@ function leaveRaidRoom(socket, { silent = false } = {}) {
   socket.data.raidRoomId = null;
 }
 
-function startRaidRoom(idA, idB, nameA, nameB, difficulty) {
+function startRaidRoom(idA, idB, nameA, nameB, bossId, difficulty) {
   const code = makeRoomCode();
-  const bossSpec = RAID_BOSS_STATS[difficulty];
+  const bossSpec = RAID_BOSS_REGISTRY[bossId][difficulty];
   raidRooms[code] = {
     code,
+    bossId,
     difficulty,
     players: [idA, idB],
     names: { [idA]: nameA, [idB]: nameB },
@@ -184,6 +197,7 @@ function startRaidRoom(idA, idB, nameA, nameB, difficulty) {
   room.players.forEach((id) => {
     const oppId = otherRaidPlayer(room, id);
     io.to(id).emit('raid_deck_select_start', {
+      bossId,
       difficulty,
       players: [
         { name: room.names[id] },
@@ -451,14 +465,16 @@ io.on('connection', (socket) => {
   socket.on('quick_match_raid', (data) => {
     try {
       const name = (data && data.name) || 'プレイヤー';
+      const bossId = (data && data.bossId) || 'erebos';
       const difficulty = (data && data.difficulty) || 'easy';
-      if (!RAID_BOSS_STATS[difficulty]) return;
+      const bossSpecs = RAID_BOSS_REGISTRY[bossId];
+      if (!bossSpecs || !bossSpecs[difficulty]) return;
       removeFromRaidQueue(socket.id);
 
-      const queue = raidQueues[difficulty];
+      const queue = getRaidQueue(bossId, difficulty);
       if (queue.length > 0) {
         const partner = queue.shift();
-        startRaidRoom(partner.socketId, socket.id, partner.name, name, difficulty);
+        startRaidRoom(partner.socketId, socket.id, partner.name, name, bossId, difficulty);
       } else {
         queue.push({ socketId: socket.id, name });
         socket.emit('raid_quick_match_waiting');
@@ -490,6 +506,7 @@ io.on('connection', (socket) => {
         room.players.forEach((id) => {
           const oppId = otherRaidPlayer(room, id);
           io.to(id).emit('raid_battle_start', {
+            bossId: room.bossId,
             yourDeck: room.playerDecks[id],
             opponentDeck: room.playerDecks[oppId],
             opponentName: room.names[oppId],
