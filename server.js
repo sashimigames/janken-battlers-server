@@ -25,6 +25,56 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
+
+// ============================================================
+//  永続DB(プレイヤー情報) — lowdb + JSON1ファイル
+// ------------------------------------------------------------
+// ランクマ/フレンド機能などの土台。「同じ人だとサーバーが継続して
+// 認識できる」ようにするための最小構成で、今のところ保存するだけで
+// 参照する機能(ランキング表示・フレンド一覧など)はまだ無い。
+//
+// ⚠️ 重要: Renderの無料/Standardプランはファイルシステムが
+//   「エフェメラル」(再デプロイ・スリープ復帰のたびに消える)。
+//   このままだと再デプロイの度にプレイヤーDBがリセットされる。
+//   本番でずっと保持したい場合は Render の「Disk」機能(有料、
+//   1GBあたり月$0.25程度〜)を追加し、DB_FILE の保存先をその
+//   マウントパス配下に向けること。今回はまず「動く土台」として
+//   ローカルファイルDBにしている(軽め、で合意した通り)。
+// ============================================================
+const DB_DIR = path.join(__dirname, 'data');
+const DB_FILE = path.join(DB_DIR, 'db.json');
+if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+
+const db = low(new FileSync(DB_FILE));
+db.defaults({ players: [] }).write();
+
+// プレイヤーを登録/更新する。idはクライアント発行の永続UUID
+// (端末のセーブデータに保存されている)。名前を変えても同じidなら
+// 同一プレイヤーとして扱う。
+function upsertPlayer(id, name) {
+  const now = Date.now();
+  const existing = db.get('players').find({ id }).value();
+  if (existing) {
+    db.get('players').find({ id }).assign({ name: name || existing.name, lastSeen: now }).write();
+    return db.get('players').find({ id }).value();
+  }
+  const fresh = {
+    id,
+    name: name || 'プレイヤー',
+    rating: 1000,   // 将来のランクマ用。今は未使用(誰も読み書きしていない)。
+    wins: 0,        // 同上
+    losses: 0,      // 同上
+    friends: [],    // 将来のフレンド機能用。今は未使用。
+    createdAt: now,
+    lastSeen: now,
+  };
+  db.get('players').push(fresh).write();
+  return fresh;
+}
 
 const app = express();
 app.use(cors());
@@ -397,6 +447,21 @@ function resolveRaidTurn(room) {
 io.on('connection', (socket) => {
   socket.data.roomId = null;
   socket.data.raidRoomId = null;
+  socket.data.playerId = null;
+
+  // ---- プレイヤーID登録(ランクマ/フレンド機能の土台) ----
+  socket.on('register_player', (data) => {
+    try {
+      const id = data && data.id;
+      const name = data && data.name;
+      if (!id || typeof id !== 'string') return;
+      socket.data.playerId = id;
+      const player = upsertPlayer(id, typeof name === 'string' ? name.slice(0, 20) : undefined);
+      socket.emit('player_registered', { id: player.id, name: player.name, rating: player.rating });
+    } catch (e) {
+      console.error('[register_player]', e);
+    }
+  });
 
   // ---- PvP(既存) ----
   socket.on('create_room', (data) => {
